@@ -1,5 +1,7 @@
 #include "kmeans_clusters.h"
 
+#include <ydb/library/yql/udfs/common/knn/knn-defines.h>
+
 #include <library/cpp/dot_product/dot_product.h>
 #include <library/cpp/l1_distance/l1_distance.h>
 #include <library/cpp/l2_distance/l2_distance.h>
@@ -248,7 +250,7 @@ public:
             return false;
         }
         for (const auto& cluster: newClusters) {
-            if (!IsExpectedSize(cluster)) {
+            if (!IsExpectedFormat(cluster)) {
                 return false;
             }
         }
@@ -330,7 +332,7 @@ public:
     }
 
     std::optional<ui32> FindCluster(TArrayRef<const char> embedding) override {
-        if (!IsExpectedSize(embedding)) {
+        if (!IsExpectedFormat(embedding)) {
             return {};
         }
         auto min = TMetric::Init();
@@ -354,14 +356,22 @@ public:
     void AggregateToCluster(ui32 pos, const TArrayRef<const char>& embedding, ui64 weight) override {
         auto& aggregate = NextClusters.at(pos);
         auto* coords = aggregate.data();
-        Y_ENSURE(IsExpectedSize(embedding));
+        Y_ENSURE(IsExpectedFormat(embedding));
         for (auto coord : this->GetCoords(embedding.data())) {
             *coords++ += (TSum)coord * weight;
         }
         NextClusterSizes.at(pos) += weight;
     }
 
-    bool IsExpectedSize(const TArrayRef<const char>& data) override {
+    bool IsExpectedFormat(const TArrayRef<const char>& data) override {
+        if (TypeByte != data.back()) {
+            return false;
+        }
+
+        if (IsBitQuantized()) {
+            return data.size() >= 2 && Dimensions == (data.size() - 2) * 8 - data[data.size() - 2];
+        }
+
         return data.size() == 1 + sizeof(TCoord) * Dimensions;
     }
 
@@ -373,6 +383,10 @@ public:
     }
 
 private:
+    inline bool IsBitQuantized() const {
+        return TypeByte == Format<bool>;
+    }
+
     auto GetCoords(const char* coords) {
         return std::span{reinterpret_cast<const TCoord*>(coords), Dimensions};
     }
@@ -397,22 +411,22 @@ std::unique_ptr<IClusters> CreateClusters(const Ydb::Table::VectorIndexSettings&
         return nullptr;
     }
 
-    const ui8 typeVal = (ui8)settings.vector_type();
     const ui32 dim = settings.vector_dimension();
 
     auto handleMetric = [&]<typename T>() -> std::unique_ptr<IClusters> {
+        const ui8 typeByte = static_cast<ui8>(Format<T>);
         switch (settings.metric()) {
             case Ydb::Table::VectorIndexSettings::SIMILARITY_INNER_PRODUCT:
-                return std::make_unique<TClusters<TMaxInnerProductSimilarity<T>>>(dim, maxRounds, typeVal);
+                return std::make_unique<TClusters<TMaxInnerProductSimilarity<T>>>(dim, maxRounds, typeByte);
             case Ydb::Table::VectorIndexSettings::SIMILARITY_COSINE:
             case Ydb::Table::VectorIndexSettings::DISTANCE_COSINE:
                 // We don't need to have separate implementation for distance,
                 // because clusters will be same as for similarity
-                return std::make_unique<TClusters<TCosineSimilarity<T>>>(dim, maxRounds, typeVal);
+                return std::make_unique<TClusters<TCosineSimilarity<T>>>(dim, maxRounds, typeByte);
             case Ydb::Table::VectorIndexSettings::DISTANCE_MANHATTAN:
-                return std::make_unique<TClusters<TL1Distance<T>>>(dim, maxRounds, typeVal);
+                return std::make_unique<TClusters<TL1Distance<T>>>(dim, maxRounds, typeByte);
             case Ydb::Table::VectorIndexSettings::DISTANCE_EUCLIDEAN:
-                return std::make_unique<TClusters<TL2Distance<T>>>(dim, maxRounds, typeVal);
+                return std::make_unique<TClusters<TL2Distance<T>>>(dim, maxRounds, typeByte);
             default:
                 error = TStringBuilder() << "Invalid metric: " << static_cast<int>(settings.metric());
                 return nullptr;
